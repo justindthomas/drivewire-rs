@@ -191,12 +191,14 @@ impl Server {
                     self.handle_fastwrite(&mut t, channel).await?;
                 }
                 Decoded::Unknown(b) => {
-                    tracing::error!(opcode = format_args!("{b:#04x}"), "unknown opcode — closing session");
-                    return Err(ServerError::UnknownOpcode(b));
+                    // Real serial lines emit line-state glitches at reset
+                    // and the occasional dropped/corrupted byte. Log and
+                    // resync at the next opcode rather than tearing the
+                    // session down — matches pyDriveWire / DW4 behavior.
+                    tracing::warn!(opcode = format_args!("{b:#04x}"), "unknown opcode (skipped, resyncing)");
                 }
                 Decoded::Op(other) => {
-                    tracing::error!(?other, "opcode known but unimplemented — closing session to avoid desync");
-                    return Err(ServerError::UnknownOpcode(other as u8));
+                    tracing::warn!(?other, "opcode known but unimplemented (skipped)");
                 }
             }
         }
@@ -846,16 +848,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_opcode_closes_session() {
+    async fn unknown_opcode_is_skipped_and_session_continues() {
+        // Real serial lines emit junk bytes (FPGA reset glitches,
+        // half-frames, etc.). The server should log and resync, not
+        // terminate. After a junk 0x1f, a legitimate OP_TIME must still
+        // succeed.
         let server = Arc::new(Server::new());
         let (mut client, server_side) = duplex(64);
         let task = tokio::spawn(async move { server.run(server_side).await });
 
-        client.write_all(&[0x01]).await.unwrap();
-        drop(client);
+        client.write_all(&[0x1f, 0x23]).await.unwrap();
+        let mut resp = [0u8; 6];
+        client.read_exact(&mut resp).await.unwrap();
+        assert!((1..=12).contains(&resp[1]), "month {}", resp[1]);
 
-        let res = task.await.unwrap();
-        assert!(matches!(res, Err(ServerError::UnknownOpcode(0x01))));
+        drop(client);
+        let _ = task.await;
     }
 
     #[tokio::test]
