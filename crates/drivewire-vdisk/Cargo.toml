@@ -1,0 +1,13 @@
+[package]
+name = "drivewire-vdisk"
+version = "0.0.0"
+description = "Virtual disk backends (DSK and friends) for drivewire-rs"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+drivewire-proto = { path = "../drivewire-proto" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

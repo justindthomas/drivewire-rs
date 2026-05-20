@@ -1,0 +1,10 @@
+[package]
+name = "drivewire-proto"
+version = "0.0.0"
+description = "DriveWire 3/4 wire-protocol primitives (opcodes, LSN, checksum)"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }

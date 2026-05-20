@@ -1,0 +1,22 @@
+[package]
+name = "drivewire-cli"
+version = "0.0.0"
+description = "dw command-line for drivewire-rs"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "dw"
+path = "src/main.rs"
+
+[dependencies]
+drivewire-proto = { path = "../drivewire-proto" }
+drivewire-vdisk = { path = "../drivewire-vdisk" }
+drivewire-transport = { path = "../drivewire-transport" }
+drivewire-server = { path = "../drivewire-server" }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

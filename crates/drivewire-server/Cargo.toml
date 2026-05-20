@@ -1,0 +1,16 @@
+[package]
+name = "drivewire-server"
+version = "0.0.0"
+description = "DriveWire 3/4 server state machine"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+drivewire-proto = { path = "../drivewire-proto" }
+drivewire-vdisk = { path = "../drivewire-vdisk" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+time = { workspace = true }
