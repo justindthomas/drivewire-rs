@@ -3,8 +3,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use drivewire_proto::Opcode;
 use drivewire_server::Server;
 use drivewire_vdisk::{DskFile, VDisk};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -33,6 +36,10 @@ enum Cmd {
     Unmount(UnmountArgs),
     /// Show drive + vserial status from a running daemon.
     Status(StatusArgs),
+    /// Open a serial / TCP transport, wait for a DWINIT from a guest, and
+    /// report whether the handshake works. Useful for bringing up a
+    /// physical CoCo over USB-serial.
+    Probe(ProbeArgs),
 }
 
 #[derive(Args)]
@@ -81,6 +88,16 @@ struct ServeArgs {
     #[arg(long, value_name = "PATH")]
     disk0: Option<PathBuf>,
 
+    /// Skip the USB-serial low-latency timer ioctl (macOS only, default
+    /// on for --serial). Set this if your adapter rejects IOSSDATALAT.
+    #[arg(long)]
+    no_low_latency: bool,
+
+    /// Drain stale bytes from the serial RX buffer for this many ms
+    /// after open. Set to 0 to skip.
+    #[arg(long, default_value_t = 250, value_name = "MS")]
+    drain_ms: u64,
+
     /// Bind a Unix-domain socket for `dw attach` clients. Default path:
     /// /tmp/drivewire.sock. Pass --no-attach-socket to disable.
     #[arg(long, value_name = "PATH", default_value = DEFAULT_ATTACH_SOCKET, conflicts_with = "no_attach_socket")]
@@ -98,6 +115,29 @@ struct ServeArgs {
     /// Skip binding the control socket.
     #[arg(long)]
     no_control_socket: bool,
+}
+
+#[derive(Args)]
+struct ProbeArgs {
+    /// Serial device.
+    #[arg(long, conflicts_with = "tcp", value_name = "DEVICE")]
+    serial: Option<PathBuf>,
+
+    /// Baud rate when probing serial.
+    #[arg(long, default_value_t = 57_600)]
+    baud: u32,
+
+    /// TCP address to connect to (e.g. an emulator's Becker listener).
+    #[arg(long, value_name = "ADDR")]
+    tcp: Option<String>,
+
+    /// Seconds to wait for an inbound byte from the guest.
+    #[arg(long, default_value_t = 10)]
+    timeout: u64,
+
+    /// Skip the macOS USB-serial low-latency timer ioctl.
+    #[arg(long)]
+    no_low_latency: bool,
 }
 
 #[derive(Args)]
@@ -131,6 +171,7 @@ async fn main() -> Result<()> {
         Cmd::Mount(args) => mount(args).await,
         Cmd::Unmount(args) => unmount(args).await,
         Cmd::Status(args) => status(args).await,
+        Cmd::Probe(args) => probe(args).await,
     }
 }
 
@@ -169,8 +210,15 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     match (args.serial, args.tcp) {
         (Some(dev), None) => {
-            let port = drivewire_transport::open_serial(&dev, args.baud)?;
+            let mut port = drivewire_transport::open_serial(&dev, args.baud)?;
             tracing::info!(device = %dev.display(), baud = args.baud, "serial transport open");
+            if !args.no_low_latency {
+                drivewire_transport::set_low_latency(&port, 1);
+            }
+            if args.drain_ms > 0 {
+                drivewire_transport::drain_serial(&mut port, Duration::from_millis(args.drain_ms))
+                    .await;
+            }
             Arc::clone(&server).run(port).await?;
         }
         (None, Some(addr)) => {
@@ -258,6 +306,79 @@ async fn attach(args: AttachArgs) -> Result<()> {
         _ = sock_to_stdout => {}
     }
     Ok(())
+}
+
+async fn probe(args: ProbeArgs) -> Result<()> {
+    use tokio::io::{AsyncRead, AsyncWrite};
+    let mut transport: Box<dyn AsyncRead + Unpin + Send>;
+    let mut writer: Box<dyn AsyncWrite + Unpin + Send>;
+
+    match (args.serial.clone(), args.tcp.clone()) {
+        (Some(dev), None) => {
+            eprintln!("[probe] opening {} at {} baud", dev.display(), args.baud);
+            let mut port = drivewire_transport::open_serial(&dev, args.baud)?;
+            if !args.no_low_latency {
+                drivewire_transport::set_low_latency(&port, 1);
+            }
+            let drained = drivewire_transport::drain_serial(&mut port, Duration::from_millis(250))
+                .await;
+            if drained > 0 {
+                eprintln!("[probe] drained {drained} stale byte(s) from RX buffer");
+            }
+            let (r, w) = tokio::io::split(port);
+            transport = Box::new(r);
+            writer = Box::new(w);
+        }
+        (None, Some(addr)) => {
+            eprintln!("[probe] listening on {addr} — connect your client (e.g. XRoar) now");
+            let listener = drivewire_transport::bind_tcp(&addr).await?;
+            let stream = drivewire_transport::accept_tcp(&listener).await?;
+            let (r, w) = tokio::io::split(stream);
+            transport = Box::new(r);
+            writer = Box::new(w);
+        }
+        (None, None) => anyhow::bail!("pass --serial DEVICE or --tcp ADDR"),
+        (Some(_), Some(_)) => unreachable!("clap enforces conflicts_with"),
+    }
+
+    eprintln!(
+        "[probe] waiting up to {}s for a byte from the guest (reset the CoCo if it's idle)...",
+        args.timeout
+    );
+    let mut first = [0u8; 1];
+    let r = tokio::time::timeout(Duration::from_secs(args.timeout), transport.read_exact(&mut first)).await;
+    match r {
+        Err(_) => {
+            eprintln!("[probe] no bytes received — common causes:");
+            eprintln!("        - baud rate mismatch (CoCo3 HDB-DOS bitbanger is usually 57600)");
+            eprintln!("        - wrong ROM on CoCo (need hdbdw3cc3.rom for serial, not hdbdw3bck.rom)");
+            eprintln!("        - cable wiring: CoCo 4-pin DIN pin 4 (TX) → host RX, pin 2 (RX) ← host TX, pin 3 (GND)");
+            anyhow::bail!("silent guest");
+        }
+        Ok(Err(e)) => anyhow::bail!("read error: {e}"),
+        Ok(Ok(_)) => {}
+    }
+    let b = first[0];
+    eprintln!("[probe] first byte: {b:#04x}");
+    if b == 0x5A {
+        let mut driver = [0u8; 1];
+        transport.read_exact(&mut driver).await?;
+        eprintln!(
+            "[probe] OP_DWINIT driver={:#04x} — sending DW4 response 0x04",
+            driver[0]
+        );
+        writer.write_all(&[0x04]).await?;
+        eprintln!("[probe] handshake complete. Cable + ROM + baud are good.");
+        Ok(())
+    } else if let Ok(op) = Opcode::try_from(b) {
+        eprintln!("[probe] decoded as {op:?} — guest is talking, but DWINIT is the canonical first byte; this server is mid-session or the CoCo skipped DWINIT.");
+        Ok(())
+    } else {
+        eprintln!(
+            "[probe] {b:#04x} is not a known DriveWire opcode. Most likely cause: wrong baud rate."
+        );
+        anyhow::bail!("non-DW data on the wire");
+    }
 }
 
 /// Outcome of feeding one stdin byte through the escape-sequence state

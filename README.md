@@ -81,6 +81,67 @@ target/release/dw serve \
   --disk0 path/to/disk.dsk
 ```
 
+`dw serve --serial` automatically applies two real-CoCo-specific tweaks
+on open:
+
+- **USB-serial latency timer → 1 ms** (macOS `IOSSDATALAT` ioctl). The
+  default 16 ms timer on FTDI / PL2303 / CH340 chips would otherwise add
+  ~30 ms of round-trip latency to every disk-sector exchange. Pass
+  `--no-low-latency` to opt out if your adapter rejects the ioctl.
+- **Drain stale RX bytes** for `--drain-ms 250` after open, so a half-
+  packet from a previous session can't desync the first `OP_READ`.
+
+**Cable wiring** (4-pin DIN bitbanger on CoCo to USB-TTL or DB-9 RS-232):
+
+| CoCo DIN pin | Direction | Host |
+|---|---|---|
+| 4 (CD, also used as TX) | → | host RX |
+| 2 (RXD) | ← | host TX |
+| 3 (GND) | — | host GND |
+| 1 (carrier sense) | (unused) | — |
+
+For real RS-232 you need a level-shifter (e.g. MAX232) between the CoCo's
+TTL pins and the DB-9; for a USB-TTL adapter (FTDI cable, CP2102 board)
+you can wire DIN-pin-4 → adapter RXD directly.
+
+**ROM on the CoCo3** depends on the cable:
+
+- Bitbanger serial (this section): `hdbdw3cc3.rom` (or `hdbdw4cc3.rom` for
+  the DW4 vserial-aware variant). Get them from the Toolshed
+  `hdbdos-toolshed-2.1.zip` release.
+- Becker port: `hdbdw3bck.rom` / `hdbdw3bc3.rom` — **not for bitbanger
+  serial**, only for emulators or the CoCo3FPGA.
+
+If you have a **CoCoSDC**, recent firmware also offers a high-speed UART
+mode that bypasses the bitbanger; the wire protocol is identical, you
+just get higher baud rates.
+
+### Probe a connection without booting an OS
+
+Bringing up serial for the first time? `dw probe` opens the line, sets
+low latency, drains, and listens for the first DWINIT from the guest —
+no disks, no daemon, just "does the handshake work?".
+
+```bash
+target/release/dw probe --serial /dev/tty.usbserial-XYZ --baud 57600
+# then reset the CoCo (or EXEC into HDB-DOS) to make it talk
+```
+
+Success looks like:
+
+```
+[probe] opening /dev/tty.usbserial-XYZ at 57600 baud
+[probe] USB-serial latency timer set
+[probe] waiting up to 10s for a byte from the guest...
+[probe] first byte: 0x5a
+[probe] OP_DWINIT driver=0x42 — sending DW4 response 0x04
+[probe] handshake complete. Cable + ROM + baud are good.
+```
+
+Failures get diagnostic guidance (baud mismatch, wrong ROM, cable
+wiring). Also works against TCP guests for emulator triage:
+`dw probe --tcp 0.0.0.0:65504`.
+
 ### Attach to a vserial channel (SSH-console)
 
 After NitrOS-9 boots and `tsmon /N1&` is running on the guest:
