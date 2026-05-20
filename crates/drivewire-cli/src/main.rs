@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use drivewire_server::Server;
 use drivewire_vdisk::{DskFile, VDisk};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tracing_subscriber::EnvFilter;
 
@@ -72,6 +72,12 @@ struct AttachArgs {
     /// Daemon control socket path.
     #[arg(long, default_value = DEFAULT_ATTACH_SOCKET, value_name = "PATH")]
     socket: PathBuf,
+
+    /// Skip CR -> CRLF translation on bytes coming from the guest. By
+    /// default, bare CRs (NitrOS-9's line terminator) are upgraded to
+    /// CRLF so they render correctly in a raw-mode terminal.
+    #[arg(long)]
+    raw: bool,
 }
 
 #[tokio::main]
@@ -147,19 +153,34 @@ async fn attach(args: AttachArgs) -> Result<()> {
     stream.write_all(&[args.channel]).await?;
 
     let _raw = RawMode::enable()?;
-    eprintln!(
-        "[dw] attached to channel {} (Ctrl-C exits)",
-        args.channel
-    );
+    eprintln!("[dw] attached to channel {} (Ctrl-C exits)\r", args.channel);
 
     let (mut sock_r, mut sock_w) = tokio::io::split(stream);
     let stdin_to_sock = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         tokio::io::copy(&mut stdin, &mut sock_w).await
     });
+    let translate = !args.raw;
     let sock_to_stdout = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
-        tokio::io::copy(&mut sock_r, &mut stdout).await
+        let mut buf = [0u8; 1024];
+        let mut had_cr = false;
+        loop {
+            let n = match sock_r.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            let payload: Vec<u8> = if translate {
+                normalize_line_endings(&buf[..n], &mut had_cr)
+            } else {
+                buf[..n].to_vec()
+            };
+            if stdout.write_all(&payload).await.is_err() {
+                break;
+            }
+            let _ = stdout.flush().await;
+        }
     });
 
     tokio::select! {
@@ -167,6 +188,78 @@ async fn attach(args: AttachArgs) -> Result<()> {
         _ = sock_to_stdout => {}
     }
     Ok(())
+}
+
+/// CR-only and LF-only line endings → CRLF (raw mode needs both bytes
+/// to advance the cursor down AND back to column 0). State persists
+/// across calls via `had_cr` so a CR that lands at a chunk boundary
+/// still pairs correctly with whatever follows.
+fn normalize_line_endings(input: &[u8], had_cr: &mut bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() + 8);
+    for &b in input {
+        match b {
+            b'\r' => {
+                if *had_cr {
+                    out.extend_from_slice(b"\r\n");
+                }
+                *had_cr = true;
+            }
+            b'\n' => {
+                out.extend_from_slice(b"\r\n");
+                *had_cr = false;
+            }
+            other => {
+                if *had_cr {
+                    out.extend_from_slice(b"\r\n");
+                }
+                out.push(other);
+                *had_cr = false;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_line_endings;
+
+    fn norm(s: &[u8]) -> Vec<u8> {
+        let mut had_cr = false;
+        normalize_line_endings(s, &mut had_cr)
+    }
+
+    #[test]
+    fn bare_cr_becomes_crlf() {
+        assert_eq!(norm(b"hi\rthere"), b"hi\r\nthere");
+    }
+
+    #[test]
+    fn existing_crlf_preserved() {
+        assert_eq!(norm(b"hi\r\nthere"), b"hi\r\nthere");
+    }
+
+    #[test]
+    fn bare_lf_becomes_crlf() {
+        assert_eq!(norm(b"hi\nthere"), b"hi\r\nthere");
+    }
+
+    #[test]
+    fn multiple_crs_each_become_crlf() {
+        // NitrOS-9 sometimes sends `\r\r\r\n` — every CR should yield a line.
+        assert_eq!(norm(b"a\r\r\r\nb"), b"a\r\n\r\n\r\nb");
+    }
+
+    #[test]
+    fn state_persists_across_chunks() {
+        let mut had_cr = false;
+        let a = normalize_line_endings(b"end-of-chunk\r", &mut had_cr);
+        assert_eq!(a, b"end-of-chunk");
+        assert!(had_cr);
+        let b = normalize_line_endings(b"next", &mut had_cr);
+        assert_eq!(b, b"\r\nnext");
+        assert!(!had_cr);
+    }
 }
 
 /// RAII wrapper that restores cooked-mode terminal on Drop.
