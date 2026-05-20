@@ -33,12 +33,15 @@ shell into a NitrOS-9 login over the same wire — SSH into the host, run
 
 ### Not yet implemented
 
-- `OP_WIREBUG_MODE` (debugger), `OP_PLAYSOUND`, named-object mounts.
-- "Carrier-detect"–style modem signaling on vserial (most CoCo software
-  doesn't need it — `tsmon` certainly doesn't).
-- A `dw attach` escape-sequence (e.g. `Ctrl-A q`) — for now, kill the attach
-  process from another terminal.
-- `dw mount` / `dw status` over the control socket.
+- `OP_WIREBUG_MODE` (the WireBug remote 6809/6309 debugger), `OP_PLAYSOUND`
+  / `OP_PLYSNDSTP`, and DW4 named-object mounts. None are required by
+  HDB-DOS or NitrOS-9 in their current configurations — these are niche
+  features awaiting a use case to drive their wire-format details out.
+- "Carrier-detect"–style modem signaling on vserial. `tsmon` doesn't
+  probe for carrier (it `I$ReadLn`s and waits for a wake byte), so the
+  SSH-console path works without it. Some modem-emulating apps (BBSes,
+  XMODEM utilities) may need it; will add `OP_SERGETSTAT` synthetic
+  responses when one of them surfaces.
 
 ## Workspace layout
 
@@ -86,9 +89,24 @@ After NitrOS-9 boots and `tsmon /N1&` is running on the guest:
 target/release/dw attach 1
 ```
 
-Your terminal goes into raw mode, presses Enter to wake `tsmon`, and you log
-in. See `examples/nitros9-multi-tty.sh` for a script that patches a NitrOS-9
+Your terminal goes into raw mode. Press Enter to wake `tsmon` and log in.
+**Exit with `Ctrl-A q`**; to send a literal Ctrl-A to the guest, type it
+twice (`Ctrl-A Ctrl-A`).
+
+See `examples/nitros9-multi-tty.sh` for a script that patches a NitrOS-9
 boot disk so `/N1`, `/N2`, and `/N3` all have `tsmon` listeners auto-started.
+
+### Manage drives on a running daemon
+
+```bash
+dw status                                   # list drives + open vserial channels
+dw mount 1 path/to/games.dsk                # mount in slot 1
+dw unmount 1
+```
+
+These connect to `/tmp/drivewire-ctl.sock` (the daemon's control socket;
+override with `--socket`). The protocol is plain text, so you can also
+poke it with `nc -U /tmp/drivewire-ctl.sock` and type `STATUS<Enter>`.
 
 ## Testing without a real CoCo
 
