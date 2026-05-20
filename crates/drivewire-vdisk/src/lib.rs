@@ -33,6 +33,11 @@ pub trait VDisk: Send + Sync {
     fn is_read_only(&self) -> bool {
         false
     }
+    /// Human-readable identifier for `dw status` and logs (usually the
+    /// backing file path).
+    fn name(&self) -> String {
+        String::from("<unnamed>")
+    }
 }
 
 /// Flat raw `.dsk` image: `sector_count * 256` bytes, LSN 0 at offset 0.
@@ -101,5 +106,9 @@ impl VDisk for DskFile {
 
     fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    fn name(&self) -> String {
+        self.path.display().to_string()
     }
 }

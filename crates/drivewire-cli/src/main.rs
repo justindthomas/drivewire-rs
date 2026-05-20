@@ -12,6 +12,7 @@ use tokio::net::UnixStream;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_ATTACH_SOCKET: &str = "/tmp/drivewire.sock";
+const DEFAULT_CONTROL_SOCKET: &str = "/tmp/drivewire-ctl.sock";
 
 #[derive(Parser)]
 #[command(name = "dw", version, about = "DriveWire 3/4 server")]
@@ -27,13 +28,39 @@ enum Cmd {
     /// Attach a terminal to a virtual serial channel on a running daemon.
     Attach(AttachArgs),
     /// Mount a disk image into a drive slot on a running daemon.
-    Mount {
-        slot: u8,
-        #[arg(value_name = "PATH")]
-        path: PathBuf,
-        #[arg(long)]
-        read_only: bool,
-    },
+    Mount(MountArgs),
+    /// Unmount a drive slot on a running daemon.
+    Unmount(UnmountArgs),
+    /// Show drive + vserial status from a running daemon.
+    Status(StatusArgs),
+}
+
+#[derive(Args)]
+struct MountArgs {
+    /// Drive slot to mount into.
+    slot: u8,
+    /// Path to the .dsk image.
+    #[arg(value_name = "PATH")]
+    path: PathBuf,
+    /// Daemon control socket path.
+    #[arg(long, default_value = DEFAULT_CONTROL_SOCKET, value_name = "PATH")]
+    socket: PathBuf,
+}
+
+#[derive(Args)]
+struct UnmountArgs {
+    /// Drive slot to unmount.
+    slot: u8,
+    /// Daemon control socket path.
+    #[arg(long, default_value = DEFAULT_CONTROL_SOCKET, value_name = "PATH")]
+    socket: PathBuf,
+}
+
+#[derive(Args)]
+struct StatusArgs {
+    /// Daemon control socket path.
+    #[arg(long, default_value = DEFAULT_CONTROL_SOCKET, value_name = "PATH")]
+    socket: PathBuf,
 }
 
 #[derive(Args)]
@@ -62,6 +89,15 @@ struct ServeArgs {
     /// Skip binding the attach socket.
     #[arg(long)]
     no_attach_socket: bool,
+
+    /// Bind a Unix-domain socket for control commands (`dw mount`,
+    /// `dw unmount`, `dw status`). Pass --no-control-socket to disable.
+    #[arg(long, value_name = "PATH", default_value = DEFAULT_CONTROL_SOCKET, conflicts_with = "no_control_socket")]
+    control_socket: PathBuf,
+
+    /// Skip binding the control socket.
+    #[arg(long)]
+    no_control_socket: bool,
 }
 
 #[derive(Args)]
@@ -92,9 +128,9 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Serve(args) => serve(args).await,
         Cmd::Attach(args) => attach(args).await,
-        Cmd::Mount { .. } => {
-            anyhow::bail!("`dw mount` requires the daemon control socket — not yet implemented");
-        }
+        Cmd::Mount(args) => mount(args).await,
+        Cmd::Unmount(args) => unmount(args).await,
+        Cmd::Status(args) => status(args).await,
     }
 }
 
@@ -117,6 +153,16 @@ async fn serve(args: ServeArgs) -> Result<()> {
         tokio::spawn(async move {
             if let Err(e) = listener_server.run_attach_listener(&socket_path).await {
                 tracing::error!(?e, path = %socket_path.display(), "attach listener exited");
+            }
+        });
+    }
+
+    if !args.no_control_socket {
+        let listener_server = Arc::clone(&server);
+        let socket_path = args.control_socket.clone();
+        tokio::spawn(async move {
+            if let Err(e) = listener_server.run_control_listener(&socket_path).await {
+                tracing::error!(?e, path = %socket_path.display(), "control listener exited");
             }
         });
     }
@@ -153,12 +199,36 @@ async fn attach(args: AttachArgs) -> Result<()> {
     stream.write_all(&[args.channel]).await?;
 
     let _raw = RawMode::enable()?;
-    eprintln!("[dw] attached to channel {} (Ctrl-C exits)\r", args.channel);
+    eprintln!(
+        "[dw] attached to channel {} (Ctrl-A q exits, Ctrl-A Ctrl-A sends literal Ctrl-A)\r",
+        args.channel
+    );
 
     let (mut sock_r, mut sock_w) = tokio::io::split(stream);
     let stdin_to_sock = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
-        tokio::io::copy(&mut stdin, &mut sock_w).await
+        let mut buf = [0u8; 256];
+        let mut escape_armed = false;
+        loop {
+            let n = match stdin.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let mut out = Vec::with_capacity(n);
+            let mut exit = false;
+            for &b in &buf[..n] {
+                if process_input_byte(b, &mut escape_armed, &mut out) == EscapeAction::Exit {
+                    exit = true;
+                    break;
+                }
+            }
+            if !out.is_empty() && sock_w.write_all(&out).await.is_err() {
+                break;
+            }
+            if exit {
+                break;
+            }
+        }
     });
     let translate = !args.raw;
     let sock_to_stdout = tokio::spawn(async move {
@@ -188,6 +258,44 @@ async fn attach(args: AttachArgs) -> Result<()> {
         _ = sock_to_stdout => {}
     }
     Ok(())
+}
+
+/// Outcome of feeding one stdin byte through the escape-sequence state
+/// machine. `Continue` keeps processing; `Exit` tells the attach loop to
+/// quit cleanly (restoring the cooked terminal via `RawMode`'s Drop).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum EscapeAction {
+    Continue,
+    Exit,
+}
+
+/// Process one input byte. Ctrl-A is the escape prefix. After Ctrl-A,
+/// `q` or `Q` exits; another Ctrl-A sends a literal Ctrl-A to the guest;
+/// any other byte passes through unchanged (preceded by the held Ctrl-A
+/// so behaviour is non-destructive).
+fn process_input_byte(byte: u8, escape_armed: &mut bool, out: &mut Vec<u8>) -> EscapeAction {
+    const CTRL_A: u8 = 0x01;
+    if *escape_armed {
+        *escape_armed = false;
+        match byte {
+            CTRL_A => {
+                out.push(CTRL_A);
+                EscapeAction::Continue
+            }
+            b'q' | b'Q' => EscapeAction::Exit,
+            other => {
+                out.push(CTRL_A);
+                out.push(other);
+                EscapeAction::Continue
+            }
+        }
+    } else if byte == CTRL_A {
+        *escape_armed = true;
+        EscapeAction::Continue
+    } else {
+        out.push(byte);
+        EscapeAction::Continue
+    }
 }
 
 /// CR-only and LF-only line endings → CRLF (raw mode needs both bytes
@@ -222,11 +330,74 @@ fn normalize_line_endings(input: &[u8], had_cr: &mut bool) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_line_endings;
+    use super::{normalize_line_endings, process_input_byte, EscapeAction};
 
     fn norm(s: &[u8]) -> Vec<u8> {
         let mut had_cr = false;
         normalize_line_endings(s, &mut had_cr)
+    }
+
+    fn feed(bytes: &[u8]) -> (Vec<u8>, bool, bool) {
+        let mut armed = false;
+        let mut out = Vec::new();
+        let mut exit = false;
+        for &b in bytes {
+            if process_input_byte(b, &mut armed, &mut out) == EscapeAction::Exit {
+                exit = true;
+                break;
+            }
+        }
+        (out, armed, exit)
+    }
+
+    #[test]
+    fn plain_bytes_pass_through() {
+        assert_eq!(feed(b"hello"), (b"hello".to_vec(), false, false));
+    }
+
+    #[test]
+    fn ctrl_a_q_exits_and_consumes_both_bytes() {
+        let (out, armed, exit) = feed(&[0x01, b'q']);
+        assert!(exit);
+        assert!(!armed);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn ctrl_a_capital_q_also_exits() {
+        let (_out, _armed, exit) = feed(&[0x01, b'Q']);
+        assert!(exit);
+    }
+
+    #[test]
+    fn double_ctrl_a_sends_literal_ctrl_a() {
+        let (out, armed, exit) = feed(&[0x01, 0x01]);
+        assert_eq!(out, vec![0x01]);
+        assert!(!armed);
+        assert!(!exit);
+    }
+
+    #[test]
+    fn ctrl_a_then_other_byte_is_non_destructive() {
+        // The held Ctrl-A is emitted before the unrelated byte.
+        let (out, armed, exit) = feed(&[0x01, b'x']);
+        assert_eq!(out, b"\x01x");
+        assert!(!armed);
+        assert!(!exit);
+    }
+
+    #[test]
+    fn escape_state_persists_across_reads() {
+        let mut armed = false;
+        let mut out = Vec::new();
+        // First read ends with Ctrl-A only.
+        let r1 = process_input_byte(0x01, &mut armed, &mut out);
+        assert_eq!(r1, EscapeAction::Continue);
+        assert!(armed);
+        assert!(out.is_empty());
+        // Second read brings the 'q'.
+        let r2 = process_input_byte(b'q', &mut armed, &mut out);
+        assert_eq!(r2, EscapeAction::Exit);
     }
 
     #[test]
@@ -260,6 +431,67 @@ mod tests {
         assert_eq!(b, b"\r\nnext");
         assert!(!had_cr);
     }
+}
+
+async fn mount(args: MountArgs) -> Result<()> {
+    let path_str = args
+        .path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8"))?;
+    let cmd = format!("MOUNT {} {}\n", args.slot, path_str);
+    let reply = control_request(&args.socket, &cmd).await?;
+    print!("{reply}");
+    if reply.starts_with("ERROR") {
+        anyhow::bail!("mount failed");
+    }
+    Ok(())
+}
+
+async fn unmount(args: UnmountArgs) -> Result<()> {
+    let cmd = format!("UNMOUNT {}\n", args.slot);
+    let reply = control_request(&args.socket, &cmd).await?;
+    print!("{reply}");
+    if reply.starts_with("ERROR") {
+        anyhow::bail!("unmount failed");
+    }
+    Ok(())
+}
+
+async fn status(args: StatusArgs) -> Result<()> {
+    let reply = control_request(&args.socket, "STATUS\n").await?;
+    print!("{reply}");
+    Ok(())
+}
+
+/// Send one command, read until a terminal line (`OK*`, `ERROR*`, or
+/// `BYE*`). The server emits multi-line replies for STATUS, so we accept
+/// any number of lines and return the whole blob.
+async fn control_request(socket: &std::path::Path, cmd: &str) -> Result<String> {
+    let stream = UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("connect to {}", socket.display()))?;
+    let (r, mut w) = tokio::io::split(stream);
+    w.write_all(cmd.as_bytes()).await?;
+    let mut reader = tokio::io::BufReader::new(r);
+    let mut out = String::new();
+    use tokio::io::AsyncBufReadExt as _;
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            break;
+        }
+        out.push_str(&line);
+        let trimmed = line.trim_end();
+        if trimmed == "OK"
+            || trimmed.starts_with("OK ")
+            || trimmed.starts_with("ERROR")
+            || trimmed.starts_with("BYE")
+        {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// RAII wrapper that restores cooked-mode terminal on Drop.

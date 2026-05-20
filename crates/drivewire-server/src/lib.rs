@@ -19,9 +19,9 @@ pub const VSERIAL_CHANNELS: usize = 16;
 
 use drivewire_proto::opcode::{Decoded, Opcode};
 use drivewire_proto::{checksum16, DwError, Lsn};
-use drivewire_vdisk::{VDisk, SECTOR_SIZE};
+use drivewire_vdisk::{DskFile, VDisk, VDiskError, SECTOR_SIZE};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 /// Byte returned in response to OP_DWINIT. Identifies us as a DW4-class
@@ -399,6 +399,140 @@ impl Server {
             return;
         }
         self.vserial_inbox_notify[idx].notified().await;
+    }
+
+    /// Per-drive status row: slot, human name (usually file path), sector count.
+    pub async fn drive_summary(&self) -> Vec<(u8, String, u32)> {
+        let drives = self.drives.read().await;
+        let mut rows: Vec<_> = drives
+            .iter()
+            .map(|(&slot, d)| (slot, d.name(), d.sector_count()))
+            .collect();
+        rows.sort_by_key(|r| r.0);
+        rows
+    }
+
+    /// Per-channel vserial status row: channel, is-open, inbox-len, outbox-len.
+    pub async fn vserial_summary(&self) -> Vec<(u8, bool, usize, usize)> {
+        let opens = self.vserial_open.lock().await.clone();
+        let inboxes = self.vserial_inbox.lock().await;
+        let outboxes = self.vserial_outbox.lock().await;
+        (0..VSERIAL_CHANNELS)
+            .map(|i| (i as u8, opens[i], inboxes[i].len(), outboxes[i].len()))
+            .collect()
+    }
+
+    /// Open a `.dsk` file and mount it on `slot`. Convenience over the
+    /// generic `mount(...)` so the control socket can install disks
+    /// without the cli having to ship the VDisk trait knowledge.
+    pub async fn mount_dsk(
+        &self,
+        slot: u8,
+        path: &std::path::Path,
+        read_only: bool,
+    ) -> Result<(u32, String), VDiskError> {
+        let disk = DskFile::open(path, read_only).await?;
+        let sectors = disk.sector_count();
+        let name = disk.name();
+        self.mount(slot, disk).await;
+        Ok((sectors, name))
+    }
+
+    /// Bind a Unix-domain socket and serve a line-based control protocol:
+    ///     MOUNT <slot> <path>
+    ///     UNMOUNT <slot>
+    ///     STATUS
+    ///     QUIT
+    /// Each command yields `OK\n`, `ERROR <msg>\n`, or for STATUS a series
+    /// of `drive`/`vserial` lines terminated by `OK\n`.
+    pub async fn run_control_listener(
+        self: Arc<Self>,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<()> {
+        let path = path.as_ref();
+        let _ = tokio::fs::remove_file(path).await;
+        let listener = tokio::net::UnixListener::bind(path)?;
+        tracing::info!(path = %path.display(), "control socket bound");
+        loop {
+            let (stream, _addr) = listener.accept().await?;
+            let server = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Err(e) = server.handle_control(stream).await {
+                    tracing::warn!(?e, "control session ended");
+                }
+            });
+        }
+    }
+
+    /// Drive a single control-socket session.
+    pub async fn handle_control<S>(self: Arc<Self>, stream: S) -> std::io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (r, mut w) = tokio::io::split(stream);
+        let mut lines = BufReader::new(r).lines();
+        while let Some(line) = lines.next_line().await? {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let response = self.handle_control_command(trimmed).await;
+            w.write_all(response.as_bytes()).await?;
+            if response.starts_with("BYE") {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_control_command(&self, line: &str) -> String {
+        let mut it = line.splitn(3, char::is_whitespace);
+        let verb = it.next().unwrap_or("").to_ascii_uppercase();
+        match verb.as_str() {
+            "MOUNT" => match (it.next(), it.next()) {
+                (Some(slot), Some(path)) => match slot.parse::<u8>() {
+                    Ok(slot) => match self
+                        .mount_dsk(slot, std::path::Path::new(path), false)
+                        .await
+                    {
+                        Ok((sectors, name)) => {
+                            format!("OK mounted slot {slot} sectors={sectors} path={name}\n")
+                        }
+                        Err(e) => format!("ERROR mount failed: {e}\n"),
+                    },
+                    Err(_) => format!("ERROR slot must be a u8 (got {slot:?})\n"),
+                },
+                _ => "ERROR usage: MOUNT <slot> <path>\n".into(),
+            },
+            "UNMOUNT" => match it.next() {
+                Some(slot) => match slot.parse::<u8>() {
+                    Ok(slot) => {
+                        self.unmount(slot).await;
+                        format!("OK unmounted slot {slot}\n")
+                    }
+                    Err(_) => format!("ERROR slot must be a u8 (got {slot:?})\n"),
+                },
+                None => "ERROR usage: UNMOUNT <slot>\n".into(),
+            },
+            "STATUS" => {
+                let mut out = String::new();
+                for (slot, name, sectors) in self.drive_summary().await {
+                    out.push_str(&format!("drive {slot} {sectors} {name}\n"));
+                }
+                for (ch, open, inbox, outbox) in self.vserial_summary().await {
+                    if open || inbox > 0 || outbox > 0 {
+                        let state = if open { "open" } else { "closed" };
+                        out.push_str(&format!(
+                            "vserial {ch} {state} inbox={inbox} outbox={outbox}\n"
+                        ));
+                    }
+                }
+                out.push_str("OK\n");
+                out
+            }
+            "QUIT" => "BYE\n".into(),
+            other => format!("ERROR unknown verb: {other}\n"),
+        }
     }
 
     /// Bind a Unix-domain socket at `path` and accept `dw attach` clients.
@@ -821,6 +955,55 @@ mod tests {
         assert_eq!(server.drain_vserial(0).await, b"AB");
         assert_eq!(server.drain_vserial(1).await, b"X");
         assert!(server.drain_vserial(2).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn control_status_lists_drives_and_open_channels() {
+        let server = Arc::new(Server::new());
+        server.set_channel_open(2, true).await;
+        server.send_to_vserial(2, b"buffered").await;
+
+        let resp = server.handle_control_command("STATUS").await;
+        assert!(resp.contains("vserial 2 open"), "got: {resp}");
+        assert!(resp.contains("outbox=8"), "got: {resp}");
+        assert!(resp.ends_with("OK\n"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn control_mount_errors_on_missing_path() {
+        let server = Arc::new(Server::new());
+        let resp = server
+            .handle_control_command("MOUNT 0 /definitely/not/a/real/path.dsk")
+            .await;
+        assert!(resp.starts_with("ERROR mount failed"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn control_unmount_is_idempotent() {
+        let server = Arc::new(Server::new());
+        let resp = server.handle_control_command("UNMOUNT 0").await;
+        assert!(resp.starts_with("OK unmounted"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn control_rejects_bad_slot() {
+        let server = Arc::new(Server::new());
+        let resp = server.handle_control_command("MOUNT abc /x").await;
+        assert!(resp.starts_with("ERROR slot must be"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn control_unknown_verb_returns_error() {
+        let server = Arc::new(Server::new());
+        let resp = server.handle_control_command("FOOBAR").await;
+        assert!(resp.starts_with("ERROR unknown verb"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn control_quit_returns_bye() {
+        let server = Arc::new(Server::new());
+        let resp = server.handle_control_command("QUIT").await;
+        assert_eq!(resp, "BYE\n");
     }
 
     #[tokio::test]
