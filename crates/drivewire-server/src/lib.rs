@@ -10,8 +10,12 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+
+/// Number of vserial channels DriveWire 4 defines (0..=14 plus the
+/// fast-write base sentinel — 15 usable channels in practice).
+pub const VSERIAL_CHANNELS: usize = 16;
 
 use drivewire_proto::opcode::{Decoded, Opcode};
 use drivewire_proto::{checksum16, DwError, Lsn};
@@ -35,10 +39,24 @@ pub enum ServerError {
     Io(#[from] std::io::Error),
 }
 
-#[derive(Default)]
 pub struct Server {
     drives: RwLock<HashMap<u8, Arc<dyn VDisk>>>,
     print_buffer: Mutex<Vec<u8>>,
+    /// Bytes the guest has written into each vserial channel, waiting to
+    /// be picked up by the host side (PTY, attach socket, etc.).
+    vserial_inbox: Mutex<Vec<VecDeque<u8>>>,
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self {
+            drives: RwLock::default(),
+            print_buffer: Mutex::default(),
+            vserial_inbox: Mutex::new(
+                (0..VSERIAL_CHANNELS).map(|_| VecDeque::new()).collect(),
+            ),
+        }
+    }
 }
 
 impl Server {
@@ -113,19 +131,25 @@ impl Server {
                 }
                 Decoded::Op(Opcode::SerRead) => {
                     // DW4 response: 2 bytes. 0x00 = "no data on any channel."
-                    // The richer encoding (channel id in low nibble, status
-                    // in high nibble) goes in once VSerialChannel exists.
+                    // Real host->guest data flow waits on the host-side
+                    // outbox (PTY/attach socket) — not implemented yet.
                     t.write_all(&[0x00, 0x00]).await?;
                 }
                 Decoded::Op(Opcode::SerInit) => {
                     let mut ch = [0u8; 1];
                     t.read_exact(&mut ch).await?;
-                    tracing::info!(channel = ch[0], "vserial open (sink unwired)");
+                    tracing::info!(channel = ch[0], "vserial open");
                 }
                 Decoded::Op(Opcode::SerTerm) => {
                     let mut ch = [0u8; 1];
                     t.read_exact(&mut ch).await?;
                     tracing::info!(channel = ch[0], "vserial close");
+                }
+                Decoded::Op(Opcode::SerWrite) => {
+                    // 2 bytes: [channel, data]. Buffer into per-channel inbox.
+                    let mut p = [0u8; 2];
+                    t.read_exact(&mut p).await?;
+                    self.push_vserial(p[0], p[1]).await;
                 }
                 Decoded::FastWrite { channel } => {
                     self.handle_fastwrite(&mut t, channel).await?;
@@ -275,8 +299,34 @@ impl Server {
     {
         let mut b = [0u8; 1];
         t.read_exact(&mut b).await?;
-        tracing::debug!(channel, byte = format_args!("{:#04x}", b[0]), "fastwrite (vserial unwired)");
+        self.push_vserial(channel, b[0]).await;
         Ok(())
+    }
+
+    /// Buffer one guest-originated byte into the named vserial channel.
+    /// Out-of-range channels are dropped with a warning rather than
+    /// panicking — the wire is untrusted input.
+    async fn push_vserial(&self, channel: u8, byte: u8) {
+        let idx = channel as usize;
+        if idx >= VSERIAL_CHANNELS {
+            tracing::warn!(channel, "vserial write to invalid channel index");
+            return;
+        }
+        let mut inbox = self.vserial_inbox.lock().await;
+        inbox[idx].push_back(byte);
+        tracing::trace!(channel, byte = format_args!("{:#04x}", byte), "vserial in");
+    }
+
+    /// Drain accumulated bytes the guest has written to a channel.
+    /// Intended for the host-side attach path (PTY / Unix socket) and
+    /// for tests.
+    pub async fn drain_vserial(&self, channel: u8) -> Vec<u8> {
+        let idx = channel as usize;
+        if idx >= VSERIAL_CHANNELS {
+            return Vec::new();
+        }
+        let mut inbox = self.vserial_inbox.lock().await;
+        inbox[idx].drain(..).collect()
     }
 
     async fn handle_time<T>(&self, t: &mut T) -> Result<(), ServerError>
@@ -430,20 +480,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fastwrite_consumes_data_byte() {
+    async fn fastwrite_buffers_byte_into_channel_inbox() {
         let server = Arc::new(Server::new());
         let (mut client, server_side) = duplex(64);
-        let task = tokio::spawn(async move { server.run(server_side).await });
+        let server_for_run = Arc::clone(&server);
+        let task = tokio::spawn(async move { server_for_run.run(server_side).await });
 
-        // FASTWRITE channel 0 with byte 0x41 ('A'), then TIME sentinel.
-        client.write_all(&[0x80, 0x41, 0x23]).await.unwrap();
-
+        // FASTWRITE ch 0 byte 'A', ch 0 byte 'B', ch 1 byte 'X', then TIME.
+        client
+            .write_all(&[0x80, b'A', 0x80, b'B', 0x81, b'X', 0x23])
+            .await
+            .unwrap();
         let mut resp = [0u8; 6];
         client.read_exact(&mut resp).await.unwrap();
         assert!((1..=12).contains(&resp[1]));
 
         drop(client);
         let _ = task.await;
+
+        assert_eq!(server.drain_vserial(0).await, b"AB");
+        assert_eq!(server.drain_vserial(1).await, b"X");
+        assert!(server.drain_vserial(2).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serwrite_buffers_byte_into_channel_inbox() {
+        let server = Arc::new(Server::new());
+        let (mut client, server_side) = duplex(64);
+        let server_for_run = Arc::clone(&server);
+        let task = tokio::spawn(async move { server_for_run.run(server_side).await });
+
+        // SERWRITE (0xC3) ch=2 byte='Z', then TIME sentinel.
+        client.write_all(&[0xC3, 0x02, b'Z', 0x23]).await.unwrap();
+        let mut resp = [0u8; 6];
+        client.read_exact(&mut resp).await.unwrap();
+        assert!((1..=12).contains(&resp[1]));
+
+        drop(client);
+        let _ = task.await;
+
+        assert_eq!(server.drain_vserial(2).await, b"Z");
     }
 
     #[tokio::test]
