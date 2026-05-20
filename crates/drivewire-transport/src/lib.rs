@@ -12,7 +12,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio_serial::{SerialPortBuilderExt, SerialStream};
+use tokio_serial::{SerialPort, SerialPortBuilderExt, SerialStream};
 
 mod low_latency;
 
@@ -33,13 +33,30 @@ pub enum TransportError {
 }
 
 /// Open a serial port for DriveWire (8-N-1, no flow control).
+///
+/// Cycles DTR low → 100 ms pause → high on open. Some DriveWire guests
+/// (notably the CoCo3FPGA on the DE-1) only initiate DriveWire when they
+/// see a fresh DTR rising edge — DTR steady-high doesn't trigger a new
+/// session. The cycle simulates "host just connected" so the guest
+/// rearms its boot path.
 pub fn open_serial(path: &Path, baud: u32) -> Result<SerialStream, TransportError> {
-    let port = tokio_serial::new(path.to_string_lossy(), baud)
+    let mut port = tokio_serial::new(path.to_string_lossy(), baud)
         .data_bits(tokio_serial::DataBits::Eight)
         .parity(tokio_serial::Parity::None)
         .stop_bits(tokio_serial::StopBits::One)
         .flow_control(tokio_serial::FlowControl::None)
         .open_native_async()?;
+    // DTR low → high edge; RTS just held high. Errors are best-effort —
+    // some adapter chipsets don't expose these as separately controllable.
+    let _ = port.write_request_to_send(true);
+    if let Err(e) = port.write_data_terminal_ready(false) {
+        tracing::debug!(?e, "could not drop DTR");
+    } else {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if let Err(e) = port.write_data_terminal_ready(true) {
+        tracing::debug!(?e, "could not raise DTR (adapter may not support it)");
+    }
     Ok(port)
 }
 
