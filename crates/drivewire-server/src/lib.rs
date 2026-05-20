@@ -39,12 +39,26 @@ pub enum ServerError {
     Io(#[from] std::io::Error),
 }
 
+/// OS-9 SetStat / GetStat codes used over OP_SERSETSTAT / OP_SERGETSTAT.
+mod ss {
+    pub const COMST: u8 = 0x28;
+    pub const OPEN: u8 = 0x29;
+    pub const CLOSE: u8 = 0x2A;
+    /// OS-9 ComSt payload size (dev_t-style status block).
+    pub const COMST_PAYLOAD_LEN: usize = 26;
+}
+
 pub struct Server {
     drives: RwLock<HashMap<u8, Arc<dyn VDisk>>>,
     print_buffer: Mutex<Vec<u8>>,
     /// Bytes the guest has written into each vserial channel, waiting to
     /// be picked up by the host side (PTY, attach socket, etc.).
     vserial_inbox: Mutex<Vec<VecDeque<u8>>>,
+    /// Bytes the host has produced for each vserial channel, waiting to
+    /// be polled out by the guest's SERREAD / SERREADM loop.
+    vserial_outbox: Mutex<Vec<VecDeque<u8>>>,
+    /// Whether each channel has been opened by the guest.
+    vserial_open: Mutex<Vec<bool>>,
 }
 
 impl Default for Server {
@@ -55,6 +69,10 @@ impl Default for Server {
             vserial_inbox: Mutex::new(
                 (0..VSERIAL_CHANNELS).map(|_| VecDeque::new()).collect(),
             ),
+            vserial_outbox: Mutex::new(
+                (0..VSERIAL_CHANNELS).map(|_| VecDeque::new()).collect(),
+            ),
+            vserial_open: Mutex::new(vec![false; VSERIAL_CHANNELS]),
         }
     }
 }
@@ -130,26 +148,40 @@ impl Server {
                     self.handle_print_flush().await;
                 }
                 Decoded::Op(Opcode::SerRead) => {
-                    // DW4 response: 2 bytes. 0x00 = "no data on any channel."
-                    // Real host->guest data flow waits on the host-side
-                    // outbox (PTY/attach socket) — not implemented yet.
-                    t.write_all(&[0x00, 0x00]).await?;
+                    self.handle_serread(&mut t).await?;
+                }
+                Decoded::Op(Opcode::SerReadM) => {
+                    self.handle_serreadm(&mut t).await?;
                 }
                 Decoded::Op(Opcode::SerInit) => {
                     let mut ch = [0u8; 1];
                     t.read_exact(&mut ch).await?;
-                    tracing::info!(channel = ch[0], "vserial open");
+                    self.set_channel_open(ch[0], true).await;
+                    tracing::info!(channel = ch[0], "vserial init");
                 }
                 Decoded::Op(Opcode::SerTerm) => {
                     let mut ch = [0u8; 1];
                     t.read_exact(&mut ch).await?;
-                    tracing::info!(channel = ch[0], "vserial close");
+                    self.set_channel_open(ch[0], false).await;
+                    tracing::info!(channel = ch[0], "vserial term");
                 }
                 Decoded::Op(Opcode::SerWrite) => {
                     // 2 bytes: [channel, data]. Buffer into per-channel inbox.
                     let mut p = [0u8; 2];
                     t.read_exact(&mut p).await?;
                     self.push_vserial(p[0], p[1]).await;
+                }
+                Decoded::Op(Opcode::SerWriteM) => {
+                    self.handle_serwritem(&mut t).await?;
+                }
+                Decoded::Op(Opcode::SerSetStat) => {
+                    self.handle_sersetstat(&mut t).await?;
+                }
+                Decoded::Op(Opcode::SerGetStat) => {
+                    // 2 bytes: [channel, code]. No response.
+                    let mut p = [0u8; 2];
+                    t.read_exact(&mut p).await?;
+                    tracing::debug!(channel = p[0], code = format_args!("{:#04x}", p[1]), "SERGETSTAT");
                 }
                 Decoded::FastWrite { channel } => {
                     self.handle_fastwrite(&mut t, channel).await?;
@@ -329,6 +361,147 @@ impl Server {
         inbox[idx].drain(..).collect()
     }
 
+    /// Queue host-originated bytes for delivery to the guest on a vserial
+    /// channel. The guest will pick these up via OP_SERREAD / OP_SERREADM.
+    pub async fn send_to_vserial(&self, channel: u8, bytes: &[u8]) {
+        let idx = channel as usize;
+        if idx >= VSERIAL_CHANNELS {
+            tracing::warn!(channel, "send_to_vserial on invalid channel index");
+            return;
+        }
+        let mut out = self.vserial_outbox.lock().await;
+        out[idx].extend(bytes.iter().copied());
+    }
+
+    /// SERREAD response encoding follows pyDriveWire dwserver.py
+    /// `cmdSerRead`: 2-byte reply where byte 1 is a status nibble + channel
+    /// id, byte 2 is either the data byte (single-byte ready) or the count
+    /// of bytes waiting (multi-byte ready, guest must follow up with
+    /// SERREADM).
+    async fn handle_serread<T>(&self, t: &mut T) -> Result<(), ServerError>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let mut out = self.vserial_outbox.lock().await;
+        for (idx, q) in out.iter_mut().enumerate() {
+            if q.is_empty() {
+                continue;
+            }
+            if q.len() < 3 {
+                // 1-2 bytes ready: deliver one byte inline.
+                let byte = q.pop_front().expect("non-empty");
+                t.write_all(&[0x01 + idx as u8, byte]).await?;
+                return Ok(());
+            }
+            // 3+ bytes ready: tell guest to issue SERREADM.
+            let count = q.len().min(255) as u8;
+            t.write_all(&[0x11 + idx as u8, count]).await?;
+            return Ok(());
+        }
+        // No data on any channel.
+        t.write_all(&[0x00, 0x00]).await?;
+        Ok(())
+    }
+
+    /// SERWRITEM: guest sends [channel, count, ...count bytes]. Bytes go
+    /// into the channel's host-bound inbox.
+    async fn handle_serwritem<T>(&self, t: &mut T) -> Result<(), ServerError>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let mut hdr = [0u8; 2];
+        t.read_exact(&mut hdr).await?;
+        let channel = hdr[0];
+        let count = hdr[1] as usize;
+        let mut buf = vec![0u8; count];
+        t.read_exact(&mut buf).await?;
+        let idx = channel as usize;
+        if idx < VSERIAL_CHANNELS {
+            let mut inbox = self.vserial_inbox.lock().await;
+            inbox[idx].extend(buf.iter().copied());
+        } else {
+            tracing::warn!(channel, count, "SERWRITEM to invalid channel");
+        }
+        Ok(())
+    }
+
+    /// SERSETSTAT: 2 bytes [channel, code]. SS.Open / SS.Close have no
+    /// payload; SS.ComSt has a 26-byte OS-9 dev_t-style payload that we
+    /// must consume to stay in sync (we don't need its contents yet).
+    async fn handle_sersetstat<T>(&self, t: &mut T) -> Result<(), ServerError>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let mut hdr = [0u8; 2];
+        t.read_exact(&mut hdr).await?;
+        let channel = hdr[0];
+        let code = hdr[1];
+        match code {
+            ss::OPEN => {
+                self.set_channel_open(channel, true).await;
+                tracing::info!(channel, "SS.Open");
+            }
+            ss::CLOSE => {
+                self.set_channel_open(channel, false).await;
+                tracing::info!(channel, "SS.Close");
+            }
+            ss::COMST => {
+                let mut payload = [0u8; ss::COMST_PAYLOAD_LEN];
+                t.read_exact(&mut payload).await?;
+                tracing::debug!(channel, "SS.ComSt (26-byte status consumed)");
+            }
+            other => {
+                tracing::debug!(channel, code = format_args!("{other:#04x}"), "SERSETSTAT");
+            }
+        }
+        Ok(())
+    }
+
+    async fn set_channel_open(&self, channel: u8, open: bool) {
+        let idx = channel as usize;
+        if idx >= VSERIAL_CHANNELS {
+            return;
+        }
+        let mut state = self.vserial_open.lock().await;
+        state[idx] = open;
+    }
+
+    /// Whether the named channel has been opened by the guest.
+    pub async fn is_channel_open(&self, channel: u8) -> bool {
+        let idx = channel as usize;
+        if idx >= VSERIAL_CHANNELS {
+            return false;
+        }
+        *self
+            .vserial_open
+            .lock()
+            .await
+            .get(idx)
+            .unwrap_or(&false)
+    }
+
+    /// SERREADM: guest sends [channel, count] then expects `count` bytes.
+    /// Out-of-range counts are zero-padded; an unknown channel is treated
+    /// as empty.
+    async fn handle_serreadm<T>(&self, t: &mut T) -> Result<(), ServerError>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let mut p = [0u8; 2];
+        t.read_exact(&mut p).await?;
+        let channel = p[0] as usize;
+        let count = p[1] as usize;
+        let mut buf = vec![0u8; count];
+        if channel < VSERIAL_CHANNELS {
+            let mut out = self.vserial_outbox.lock().await;
+            for slot in buf.iter_mut().take(count) {
+                *slot = out[channel].pop_front().unwrap_or(0);
+            }
+        }
+        t.write_all(&buf).await?;
+        Ok(())
+    }
+
     async fn handle_time<T>(&self, t: &mut T) -> Result<(), ServerError>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send,
@@ -447,7 +620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serread_replies_no_data() {
+    async fn serread_replies_no_data_when_outboxes_empty() {
         let server = Arc::new(Server::new());
         let (mut client, server_side) = duplex(64);
         let task = tokio::spawn(async move { server.run(server_side).await });
@@ -457,6 +630,48 @@ mod tests {
         let mut resp = [0xFFu8; 2];
         client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [0x00, 0x00]);
+
+        drop(client);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn serread_delivers_single_byte_inline() {
+        let server = Arc::new(Server::new());
+        server.send_to_vserial(3, b"Q").await; // 1 byte queued for ch 3
+
+        let (mut client, server_side) = duplex(64);
+        let task = tokio::spawn(async move { server.run(server_side).await });
+
+        client.write_all(&[0x43]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        // 1-2 bytes ready encoding: byte1 = 0x01 + channel
+        assert_eq!(resp, [0x01 + 3, b'Q']);
+
+        drop(client);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn serread_then_serreadm_for_multibyte_burst() {
+        let server = Arc::new(Server::new());
+        server.send_to_vserial(2, b"hello").await; // 5 bytes >= 3
+
+        let (mut client, server_side) = duplex(64);
+        let task = tokio::spawn(async move { server.run(server_side).await });
+
+        // First poll: expect multi-byte indicator [0x13 (=0x11+2), 5].
+        client.write_all(&[0x43]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x11 + 2, 5]);
+
+        // Follow-up SERREADM (0x63) with [channel=2, count=5] → 5 bytes.
+        client.write_all(&[0x63, 0x02, 0x05]).await.unwrap();
+        let mut payload = [0u8; 5];
+        client.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"hello");
 
         drop(client);
         let _ = task.await;
@@ -501,6 +716,76 @@ mod tests {
         assert_eq!(server.drain_vserial(0).await, b"AB");
         assert_eq!(server.drain_vserial(1).await, b"X");
         assert!(server.drain_vserial(2).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sersetstat_open_close_tracks_channel_state() {
+        let server = Arc::new(Server::new());
+        let (mut client, server_side) = duplex(64);
+        let server_for_run = Arc::clone(&server);
+        let task = tokio::spawn(async move { server_for_run.run(server_side).await });
+
+        // SERSETSTAT ch=4 code=SS.Open(0x29), then SERSETSTAT ch=4 SS.Close(0x2A),
+        // followed by TIME so we can assert no desync.
+        client.write_all(&[0xC4, 0x04, 0x29]).await.unwrap();
+        client.write_all(&[0x23]).await.unwrap();
+        let mut t1 = [0u8; 6];
+        client.read_exact(&mut t1).await.unwrap();
+        assert!((1..=12).contains(&t1[1]));
+        assert!(server.is_channel_open(4).await);
+
+        client.write_all(&[0xC4, 0x04, 0x2A, 0x23]).await.unwrap();
+        let mut t2 = [0u8; 6];
+        client.read_exact(&mut t2).await.unwrap();
+        assert!((1..=12).contains(&t2[1]));
+        assert!(!server.is_channel_open(4).await);
+
+        drop(client);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn sersetstat_comst_consumes_26_byte_payload() {
+        let server = Arc::new(Server::new());
+        let (mut client, server_side) = duplex(64);
+        let server_for_run = Arc::clone(&server);
+        let task = tokio::spawn(async move { server_for_run.run(server_side).await });
+
+        // SERSETSTAT ch=0 code=SS.ComSt(0x28) + 26 payload bytes, then TIME.
+        let mut frame = vec![0xC4, 0x00, 0x28];
+        frame.extend(std::iter::repeat(0xAB).take(26));
+        frame.push(0x23);
+        client.write_all(&frame).await.unwrap();
+
+        let mut resp = [0u8; 6];
+        client.read_exact(&mut resp).await.unwrap();
+        assert!((1..=12).contains(&resp[1]));
+
+        drop(client);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn serwritem_buffers_burst_into_channel_inbox() {
+        let server = Arc::new(Server::new());
+        let (mut client, server_side) = duplex(64);
+        let server_for_run = Arc::clone(&server);
+        let task = tokio::spawn(async move { server_for_run.run(server_side).await });
+
+        // SERWRITEM (0x64) ch=3 count=5 bytes=b"hello", then TIME sentinel.
+        let mut frame = vec![0x64, 0x03, 0x05];
+        frame.extend_from_slice(b"hello");
+        frame.push(0x23);
+        client.write_all(&frame).await.unwrap();
+
+        let mut resp = [0u8; 6];
+        client.read_exact(&mut resp).await.unwrap();
+        assert!((1..=12).contains(&resp[1]));
+
+        drop(client);
+        let _ = task.await;
+
+        assert_eq!(server.drain_vserial(3).await, b"hello");
     }
 
     #[tokio::test]
