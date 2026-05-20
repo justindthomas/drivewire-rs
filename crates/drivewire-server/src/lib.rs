@@ -22,7 +22,7 @@ use drivewire_proto::{checksum16, DwError, Lsn};
 use drivewire_vdisk::{VDisk, SECTOR_SIZE};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 /// Byte returned in response to OP_DWINIT. Identifies us as a DW4-class
 /// server. There is no formally-standardised value; refine once we have
@@ -59,6 +59,9 @@ pub struct Server {
     vserial_outbox: Mutex<Vec<VecDeque<u8>>>,
     /// Whether each channel has been opened by the guest.
     vserial_open: Mutex<Vec<bool>>,
+    /// One Notify per channel; signaled when push_vserial appends a byte
+    /// so an attached host reader can wake instead of polling.
+    vserial_inbox_notify: Vec<Notify>,
 }
 
 impl Default for Server {
@@ -73,6 +76,7 @@ impl Default for Server {
                 (0..VSERIAL_CHANNELS).map(|_| VecDeque::new()).collect(),
             ),
             vserial_open: Mutex::new(vec![false; VSERIAL_CHANNELS]),
+            vserial_inbox_notify: (0..VSERIAL_CHANNELS).map(|_| Notify::new()).collect(),
         }
     }
 }
@@ -338,14 +342,17 @@ impl Server {
     /// Buffer one guest-originated byte into the named vserial channel.
     /// Out-of-range channels are dropped with a warning rather than
     /// panicking — the wire is untrusted input.
-    async fn push_vserial(&self, channel: u8, byte: u8) {
+    pub async fn push_vserial(&self, channel: u8, byte: u8) {
         let idx = channel as usize;
         if idx >= VSERIAL_CHANNELS {
             tracing::warn!(channel, "vserial write to invalid channel index");
             return;
         }
-        let mut inbox = self.vserial_inbox.lock().await;
-        inbox[idx].push_back(byte);
+        {
+            let mut inbox = self.vserial_inbox.lock().await;
+            inbox[idx].push_back(byte);
+        }
+        self.vserial_inbox_notify[idx].notify_one();
         tracing::trace!(channel, byte = format_args!("{:#04x}", byte), "vserial in");
     }
 
@@ -371,6 +378,104 @@ impl Server {
         }
         let mut out = self.vserial_outbox.lock().await;
         out[idx].extend(bytes.iter().copied());
+    }
+
+    /// Number of bytes queued for the guest on a channel. Useful for
+    /// monitoring / tests.
+    pub async fn vserial_outbox_len(&self, channel: u8) -> usize {
+        let idx = channel as usize;
+        if idx >= VSERIAL_CHANNELS {
+            return 0;
+        }
+        self.vserial_outbox.lock().await[idx].len()
+    }
+
+    /// Wait until `push_vserial` deposits new bytes for `channel`.
+    pub async fn wait_vserial_inbox(&self, channel: u8) {
+        let idx = channel as usize;
+        if idx >= VSERIAL_CHANNELS {
+            // Wait forever on an invalid channel — caller bug.
+            std::future::pending::<()>().await;
+            return;
+        }
+        self.vserial_inbox_notify[idx].notified().await;
+    }
+
+    /// Bind a Unix-domain socket at `path` and accept `dw attach` clients.
+    /// Each connection sends a single channel-id byte, then becomes the
+    /// bidirectional pipe for that channel (via `handle_attach`).
+    pub async fn run_attach_listener(
+        self: Arc<Self>,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<()> {
+        let path = path.as_ref();
+        let _ = tokio::fs::remove_file(path).await; // best-effort stale-socket cleanup
+        let listener = tokio::net::UnixListener::bind(path)?;
+        tracing::info!(path = %path.display(), "attach socket bound");
+        loop {
+            let (mut stream, _addr) = listener.accept().await?;
+            let server = Arc::clone(&self);
+            tokio::spawn(async move {
+                let mut ch_byte = [0u8; 1];
+                if stream.read_exact(&mut ch_byte).await.is_err() {
+                    return;
+                }
+                tracing::info!(channel = ch_byte[0], "attach client connected");
+                let _ = server.handle_attach(stream, ch_byte[0]).await;
+                tracing::info!(channel = ch_byte[0], "attach client disconnected");
+            });
+        }
+    }
+
+    /// Pipe an attached host-side reader/writer to a vserial channel.
+    /// Bytes read from the stream are forwarded to the guest via the
+    /// outbox; bytes the guest writes into the inbox are written out to
+    /// the stream. Returns when either direction closes.
+    pub async fn handle_attach<S>(
+        self: Arc<Self>,
+        stream: S,
+        channel: u8,
+    ) -> std::io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut reader, mut writer) = tokio::io::split(stream);
+
+        let server_in = Arc::clone(&self);
+        let inbound = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => server_in.send_to_vserial(channel, &buf[..n]).await,
+                    Err(e) => {
+                        tracing::debug!(?e, channel, "attach reader closed");
+                        break;
+                    }
+                }
+            }
+        });
+
+        let server_out = Arc::clone(&self);
+        let outbound = tokio::spawn(async move {
+            loop {
+                let bytes = server_out.drain_vserial(channel).await;
+                if !bytes.is_empty() {
+                    if let Err(e) = writer.write_all(&bytes).await {
+                        tracing::debug!(?e, channel, "attach writer closed");
+                        break;
+                    }
+                    continue;
+                }
+                server_out.wait_vserial_inbox(channel).await;
+            }
+        });
+
+        tokio::select! {
+            _ = inbound => {}
+            _ = outbound => {}
+        }
+        Ok(())
     }
 
     /// SERREAD response encoding follows pyDriveWire dwserver.py
@@ -716,6 +821,48 @@ mod tests {
         assert_eq!(server.drain_vserial(0).await, b"AB");
         assert_eq!(server.drain_vserial(1).await, b"X");
         assert!(server.drain_vserial(2).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attach_forwards_client_writes_into_outbox() {
+        let server = Arc::new(Server::new());
+        let (mut client, server_side) = duplex(256);
+        let s = Arc::clone(&server);
+        let task = tokio::spawn(async move { s.handle_attach(server_side, 1).await });
+
+        client.write_all(b"hello").await.unwrap();
+
+        // Spin briefly for the inbound task to drain the duplex.
+        for _ in 0..50 {
+            if server.vserial_outbox_len(1).await == 5 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(server.vserial_outbox_len(1).await, 5);
+
+        drop(client);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn attach_forwards_inbox_bytes_to_client() {
+        let server = Arc::new(Server::new());
+        let (mut client, server_side) = duplex(256);
+        let s = Arc::clone(&server);
+        let task = tokio::spawn(async move { s.handle_attach(server_side, 2).await });
+
+        // Simulate the guest writing into the inbox.
+        for b in b"hi" {
+            server.push_vserial(2, *b).await;
+        }
+
+        let mut buf = [0u8; 2];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hi");
+
+        drop(client);
+        let _ = task.await;
     }
 
     #[tokio::test]
