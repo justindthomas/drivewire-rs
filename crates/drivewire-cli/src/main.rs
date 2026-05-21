@@ -84,9 +84,21 @@ struct ServeArgs {
     #[arg(long, value_name = "ADDR")]
     tcp: Option<String>,
 
-    /// Optional disk image mounted to slot 0 on startup.
+    /// Disk image mounted to drive slot 0 on startup.
     #[arg(long, value_name = "PATH")]
     disk0: Option<PathBuf>,
+
+    /// Disk image mounted to drive slot 1 on startup.
+    #[arg(long, value_name = "PATH")]
+    disk1: Option<PathBuf>,
+
+    /// Disk image mounted to drive slot 2 on startup.
+    #[arg(long, value_name = "PATH")]
+    disk2: Option<PathBuf>,
+
+    /// Disk image mounted to drive slot 3 on startup.
+    #[arg(long, value_name = "PATH")]
+    disk3: Option<PathBuf>,
 
     /// Skip the USB-serial low-latency timer ioctl (macOS only, default
     /// on for --serial). Set this if your adapter rejects IOSSDATALAT.
@@ -178,14 +190,22 @@ async fn main() -> Result<()> {
 async fn serve(args: ServeArgs) -> Result<()> {
     let server = Arc::new(Server::new());
 
-    if let Some(path) = args.disk0 {
-        let disk = DskFile::open(&path, false).await?;
-        tracing::info!(
-            path = %path.display(),
-            sectors = disk.sector_count(),
-            "mounted slot 0"
-        );
-        server.mount(0, disk).await;
+    for (slot, path) in [
+        (0u8, args.disk0),
+        (1, args.disk1),
+        (2, args.disk2),
+        (3, args.disk3),
+    ] {
+        if let Some(path) = path {
+            let disk = DskFile::open(&path, false).await?;
+            tracing::info!(
+                slot,
+                path = %path.display(),
+                sectors = disk.sector_count(),
+                "mounted disk"
+            );
+            server.mount(slot, disk).await;
+        }
     }
 
     if !args.no_attach_socket {
