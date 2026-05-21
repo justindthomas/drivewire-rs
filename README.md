@@ -30,7 +30,7 @@ shell into a NitrOS-9 login over the same wire — SSH into the host, run
 | **Transports** | TCP (Becker port, default `:65504`) and serial — own raw-`termios` blocking-thread backend, 8-N-1 |
 | **Tests** | 45 unit + integration tests passing (proto, server, CLI) |
 | **Emulator validation** | XRoar + HDB-DOS Becker (DIR + DSKINI full-disk format) and NitrOS-9 6809 L2 v3.3.0 (boots to interactive `Shell+`) |
-| **Real-hardware validation** | CoCo3FPGA on an Altera DE-1 over USB-serial — `OP_INIT` → `OP_TIME` → `OP_READEX` boot sequence confirmed |
+| **Real-hardware validation** | NitrOS-9 6809 L2 v3.3.0 boots to an interactive shell on a CoCo3FPGA (Altera DE-1) over a physical USB-serial link |
 
 ### Not yet implemented
 
