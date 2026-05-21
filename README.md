@@ -27,9 +27,10 @@ shell into a NitrOS-9 login over the same wire — SSH into the host, run
 | **DW3 disk I/O** | `OP_READ`, `OP_READEX`, `OP_REREAD`, `OP_REREADEX`, `OP_WRITE`, `OP_REWRITE` — full bidirectional checksum |
 | **DW4 system** | `OP_DWINIT`, `OP_TIME` (local clock), `OP_INIT`, `OP_TERM`, `OP_GETSTAT`, `OP_SETSTAT`, `OP_PRINT`/`OP_PRINTFLUSH`, `OP_NOP`, `OP_RESET1/2/3` |
 | **DW4 vserial** | `OP_SERINIT`, `OP_SERTERM`, `OP_SERREAD`, `OP_SERREADM`, `OP_SERWRITE`, `OP_SERWRITEM`, `OP_SERSETSTAT` (incl. SS.Open / SS.Close / SS.ComSt 26-byte payload), `OP_SERGETSTAT`, `OP_FASTWRITE0..15` |
-| **Transports** | TCP (Becker port, default `:65504`) and serial via `tokio-serial` |
-| **Tests** | 28 unit + integration tests passing (proto, server, CLI line-ending) |
-| **Real-driver validation** | HDB-DOS Becker (DIR + DSKINI full-disk format) and NitrOS-9 6809 L2 v3.3.0 (boots to interactive `Shell+`) |
+| **Transports** | TCP (Becker port, default `:65504`) and serial — own raw-`termios` blocking-thread backend, 8-N-1 |
+| **Tests** | 45 unit + integration tests passing (proto, server, CLI) |
+| **Emulator validation** | XRoar + HDB-DOS Becker (DIR + DSKINI full-disk format) and NitrOS-9 6809 L2 v3.3.0 (boots to interactive `Shell+`) |
+| **Real-hardware validation** | CoCo3FPGA on an Altera DE-1 over USB-serial — `OP_INIT` → `OP_TIME` → `OP_READEX` boot sequence confirmed |
 
 ### Not yet implemented
 
@@ -51,7 +52,7 @@ shell into a NitrOS-9 login over the same wire — SSH into the host, run
 | `drivewire-vdisk` | `VDisk` trait + flat `.dsk` backend |
 | `drivewire-transport` | Serial + TCP transport helpers |
 | `drivewire-server` | Opcode-dispatched protocol state machine, attach-socket multiplexer |
-| `drivewire-cli` | The `dw` binary (`serve`, `attach`) |
+| `drivewire-cli` | The `dw` binary (`serve`, `attach`, `mount`, `unmount`, `status`, `probe`) |
 
 ## Quick start
 
@@ -76,20 +77,21 @@ xroar -machine coco3 -romlist 'rsdos_becker=hdbdw3bc3' \
 
 ```bash
 target/release/dw serve \
-  --serial /dev/tty.usbserial-XYZ \
+  --serial /dev/cu.usbserial-XYZ \
   --baud 57600 \
   --disk0 path/to/disk.dsk
 ```
 
-`dw serve --serial` automatically applies two real-CoCo-specific tweaks
-on open:
+The serial backend is our own — raw `libc::open` + `termios` setup +
+blocking reader/writer threads bridged into async with `tokio::sync::mpsc`.
+We do *not* use `tokio-serial` / `mio-serial`: real-hardware testing
+found that stack delivered corrupt bytes against PL2303-class USB
+adapters on macOS, where `screen` and `pyserial` read the same wire
+cleanly. Our backend reads byte-for-byte the way they do.
 
-- **USB-serial latency timer → 1 ms** (macOS `IOSSDATALAT` ioctl). The
-  default 16 ms timer on FTDI / PL2303 / CH340 chips would otherwise add
-  ~30 ms of round-trip latency to every disk-sector exchange. Pass
-  `--no-low-latency` to opt out if your adapter rejects the ioctl.
-- **Drain stale RX bytes** for `--drain-ms 250` after open, so a half-
-  packet from a previous session can't desync the first `OP_READ`.
+`dw serve --serial` drains stale RX bytes for `--drain-ms` (default 250)
+after open, so a half-packet from a previous session can't desync the
+first opcode. On macOS use the `/dev/cu.*` device node, not `/dev/tty.*`.
 
 **Cable wiring** (4-pin DIN bitbanger on CoCo to USB-TTL or DB-9 RS-232):
 
@@ -118,20 +120,19 @@ just get higher baud rates.
 
 ### Probe a connection without booting an OS
 
-Bringing up serial for the first time? `dw probe` opens the line, sets
-low latency, drains, and listens for the first DWINIT from the guest —
-no disks, no daemon, just "does the handshake work?".
+Bringing up serial for the first time? `dw probe` opens the line,
+drains, and listens for the first opcode from the guest — no disks, no
+daemon, just "does the handshake work?".
 
 ```bash
-target/release/dw probe --serial /dev/tty.usbserial-XYZ --baud 57600
-# then reset the CoCo (or EXEC into HDB-DOS) to make it talk
+target/release/dw probe --serial /dev/cu.usbserial-XYZ --baud 115200
+# then reset / power-cycle the CoCo to make it talk
 ```
 
 Success looks like:
 
 ```
-[probe] opening /dev/tty.usbserial-XYZ at 57600 baud
-[probe] USB-serial latency timer set
+[probe] opening /dev/cu.usbserial-XYZ at 115200 baud
 [probe] waiting up to 10s for a byte from the guest...
 [probe] first byte: 0x5a
 [probe] OP_DWINIT driver=0x42 — sending DW4 response 0x04
@@ -141,6 +142,12 @@ Success looks like:
 Failures get diagnostic guidance (baud mismatch, wrong ROM, cable
 wiring). Also works against TCP guests for emulator triage:
 `dw probe --tcp 0.0.0.0:65504`.
+
+> **macOS USB-serial note:** baud-rate handling differs wildly by
+> chipset. FTDI and CP2102 adapters work out of the box; PL2303 clones
+> are unreliable. If `dw probe` shows the same garbage byte at *every*
+> `--baud` you try, that's the tell-tale sign of a chipset whose driver
+> ignores the rate — switch to an FTDI-based adapter.
 
 ### Attach to a vserial channel (SSH-console)
 
